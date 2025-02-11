@@ -36,9 +36,14 @@ Contributors:
 #include <soc/i2c_reg.h>
 #include <soc/i2c_struct.h>
 #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0))
- #include <soc/syscon_reg.h>
+ //#include <soc/syscon_reg.h>
+ #if __has_include(<soc/syscon_reg.h>)
+  #include <soc/syscon_reg.h>
+ #endif
 #else
- #include <soc/apb_ctrl_reg.h>
+ #if __has_include (<soc/apb_ctrl_reg.h>)
+  #include <soc/apb_ctrl_reg.h>
+ #endif
 #endif
 #include <soc/efuse_reg.h>
 
@@ -108,20 +113,12 @@ Contributors:
  #if !defined (DMA_IN_PERI_SEL_CH0_REG)
   #define DMA_IN_PERI_SEL_CH0_REG  GDMA_IN_PERI_SEL_CH0_REG
  #endif
-#endif
 
-#if (ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 3, 0))
- #define SOC_GDMA_PAIRS_PER_GROUP_MAX SOC_GDMA_PAIRS_PER_GROUP
-#endif
-
-#if defined ( ARDUINO )
- #if __has_include (<SPI.h>)
-  #include <SPI.h>
- #endif
- #if __has_include (<Wire.h>)
-  #include <Wire.h>
+ #if !defined (SOC_GDMA_PAIRS_PER_GROUP_MAX)
+  #define SOC_GDMA_PAIRS_PER_GROUP_MAX SOC_GDMA_PAIRS_PER_GROUP
  #endif
 #endif
+
 
 namespace lgfx
 {
@@ -129,6 +126,16 @@ namespace lgfx
  {
 //----------------------------------------------------------------------------
   static __attribute__ ((always_inline)) inline volatile uint32_t* reg(uint32_t addr) { return (volatile uint32_t *)ETS_UNCACHED_ADDR(addr); }
+
+  static int search_pin_number(int peripheral_sig)
+  {
+#if defined (CONFIG_IDF_TARGET_ESP32C6)
+    uint32_t result = GPIO.func_in_sel_cfg[peripheral_sig].in_sel;
+#else
+    uint32_t result = GPIO.func_in_sel_cfg[peripheral_sig].func_sel;
+#endif
+    return (result < GPIO_NUM_MAX) ? result : -1;
+  }
 
   uint32_t getApbFrequency(void)
   {
@@ -315,7 +322,12 @@ namespace lgfx
     *io_mux_reg = io_mux_val;
 
     GPIO.pin[pin].pad_driver = 0; // 1 = OpenDrain / 0 = normal output
+
+#if defined (CONFIG_IDF_TARGET_ESP32C6)
+    GPIO.func_out_sel_cfg[pin].out_sel = SIG_GPIO_OUT_IDX;
+#else
     GPIO.func_out_sel_cfg[pin].func_sel = SIG_GPIO_OUT_IDX;
+#endif
   }
 
 //----------------------------------------------------------------------------
@@ -337,10 +349,20 @@ namespace lgfx
         _gpio_pin_reg      = *reinterpret_cast<uint32_t*>(GPIO_PIN0_REG              + (pin_num * 4));
         _gpio_func_out_reg = *reinterpret_cast<uint32_t*>(GPIO_FUNC0_OUT_SEL_CFG_REG + (pin_num * 4));
 #if defined ( GPIO_ENABLE1_REG )
-        _gpio_enable = *reinterpret_cast<uint32_t*>(((_pin_num & 32) ? GPIO_ENABLE1_REG : GPIO_ENABLE_REG)) & (1 << (_pin_num & 31));
+        _gpio_enable = *reinterpret_cast<uint32_t*>(((pin_num & 32) ? GPIO_ENABLE1_REG : GPIO_ENABLE_REG)) & (1 << (pin_num & 31));
 #else
-        _gpio_enable = *reinterpret_cast<uint32_t*>(GPIO_ENABLE_REG) & (1 << (_pin_num & 31));
+        _gpio_enable = *reinterpret_cast<uint32_t*>(GPIO_ENABLE_REG) & (1 << (pin_num & 31));
 #endif
+        _in_func_num = -1;
+
+        size_t func_num = ((_gpio_func_out_reg >> GPIO_FUNC0_OUT_SEL_S) & GPIO_FUNC0_OUT_SEL_V);
+        if (func_num < sizeof(GPIO.func_in_sel_cfg) / sizeof(GPIO.func_in_sel_cfg[0])) {
+          _gpio_func_in_reg = *reinterpret_cast<uint32_t*>(GPIO_FUNC0_IN_SEL_CFG_REG + (func_num * 4));
+          if (func_num == ((_gpio_func_in_reg >> GPIO_FUNC0_IN_SEL_S) & GPIO_FUNC0_IN_SEL_V)) {
+            _in_func_num = func_num;
+// ESP_LOGD("DEBUG","backup pin:%d : func_num:%d", pin_num, _in_func_num);
+          }
+        }
       }
     }
 
@@ -349,22 +371,28 @@ namespace lgfx
       auto pin_num = (size_t)_pin_num;
       if (pin_num < GPIO_NUM_MAX)
       {
-  // ESP_LOGD("DEBUG","restore pin:%d ", _pin_num);
-  // ESP_LOGD("DEBUG","restore IO_MUX_GPIO0_REG          :%08x -> %08x ", *reinterpret_cast<uint32_t*>(GPIO_PIN_MUX_REG[_pin_num]                 ), _io_mux_gpio_reg   );
-  // ESP_LOGD("DEBUG","restore GPIO_PIN0_REG             :%08x -> %08x ", *reinterpret_cast<uint32_t*>(GPIO_PIN0_REG              + (_pin_num * 4)), _gpio_pin_reg      );
-  // ESP_LOGD("DEBUG","restore GPIO_FUNC0_OUT_SEL_CFG_REG:%08x -> %08x ", *reinterpret_cast<uint32_t*>(GPIO_FUNC0_OUT_SEL_CFG_REG + (_pin_num * 4)), _gpio_func_out_reg );
+        if ((uint16_t)_in_func_num < 256) {
+          GPIO.func_in_sel_cfg[_in_func_num].val = _gpio_func_in_reg;
+  // ESP_LOGD("DEBUG","pin:%d in_func_num:%d", (int)pin_num, (int)_in_func_num);
+        }
+
+  // ESP_LOGD("DEBUG","restore pin:%d ", pin_num);
+  // ESP_LOGD("DEBUG","restore IO_MUX_GPIO0_REG          :%08x -> %08x ", *reinterpret_cast<uint32_t*>(GPIO_PIN_MUX_REG[pin_num]                 ), _io_mux_gpio_reg   );
+  // ESP_LOGD("DEBUG","restore GPIO_PIN0_REG             :%08x -> %08x ", *reinterpret_cast<uint32_t*>(GPIO_PIN0_REG              + (pin_num * 4)), _gpio_pin_reg      );
+  // ESP_LOGD("DEBUG","restore GPIO_FUNC0_OUT_SEL_CFG_REG:%08x -> %08x ", *reinterpret_cast<uint32_t*>(GPIO_FUNC0_OUT_SEL_CFG_REG + (pin_num * 4)), _gpio_func_out_reg );
         *reinterpret_cast<uint32_t*>(GPIO_PIN_MUX_REG[_pin_num]) = _io_mux_gpio_reg;
-        *reinterpret_cast<uint32_t*>(GPIO_PIN0_REG              + (_pin_num * 4)) = _gpio_pin_reg;
-        *reinterpret_cast<uint32_t*>(GPIO_FUNC0_OUT_SEL_CFG_REG + (_pin_num * 4)) = _gpio_func_out_reg;
+        *reinterpret_cast<uint32_t*>(GPIO_PIN0_REG              + (pin_num * 4)) = _gpio_pin_reg;
+        *reinterpret_cast<uint32_t*>(GPIO_FUNC0_OUT_SEL_CFG_REG + (pin_num * 4)) = _gpio_func_out_reg;
+
 #if defined ( GPIO_ENABLE1_REG )
-        auto gpio_enable_reg = reinterpret_cast<uint32_t*>(((_pin_num & 32) ? GPIO_ENABLE1_REG : GPIO_ENABLE_REG));
+        auto gpio_enable_reg = reinterpret_cast<uint32_t*>(((pin_num & 32) ? GPIO_ENABLE1_REG : GPIO_ENABLE_REG));
 #else
         auto gpio_enable_reg = reinterpret_cast<uint32_t*>(GPIO_ENABLE_REG);
 #endif
 
-        uint32_t pin_mask = 1 << (_pin_num & 31);
+        uint32_t pin_mask = 1 << (pin_num & 31);
         uint32_t val = *gpio_enable_reg;
-  // ESP_LOGD("DEBUG","restore GPIO_ENABLE_REG:%08x", *gpio_enable_reg);
+  // ESP_LOGD("DEBUG","restore GPIO_ENABLE_REG:%08x", (int)*gpio_enable_reg);
         if (_gpio_enable)
         {
            val |= pin_mask;
@@ -374,7 +402,6 @@ namespace lgfx
           val &= ~pin_mask;
         }
         *gpio_enable_reg = val;
-  // ESP_LOGD("DEBUG","restore GPIO_ENABLE_REG:%08x", *gpio_enable_reg);
       }
     }
 
@@ -469,7 +496,12 @@ namespace lgfx
       }
       if (_spi_handle[spi_host] == nullptr)
       {
-        _spi_handle[spi_host] = spiStartBus(spi_port, SPI_CLK_EQU_SYSCLK, 0, 0);
+        auto spi_num = spi_port;
+#if  defined ( CONFIG_IDF_TARGET_ESP32S3 )
+        spi_num = HSPI;
+        if (spi_host == SPI2_HOST) { spi_num = FSPI; }
+#endif
+        _spi_handle[spi_host] = spiStartBus(spi_num, SPI_CLK_EQU_SYSCLK, 0, 0);
       }
 
 #endif
@@ -487,6 +519,9 @@ namespace lgfx
         buscfg.intr_flags = 0;
 #if defined (ESP_IDF_VERSION_VAL)
   #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0))
+    #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0))
+        buscfg.data_io_default_level = 0;
+    #endif
         buscfg.isr_cpu_id = ESP_INTR_CPU_AFFINITY_AUTO;
   #elif (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0))
         buscfg.isr_cpu_id = INTR_CPU_ID_AUTO;
@@ -569,8 +604,27 @@ namespace lgfx
 
       uint32_t user = SPI_USR_MOSI | SPI_USR_MISO | SPI_DOUTDIN;
       if (spi_mode == 1 || spi_mode == 2) user |= SPI_CK_OUT_EDGE;
-      uint32_t pin = 0;
-      if (spi_mode & 2) pin = SPI_CK_IDLE_EDGE;
+      uint32_t pin = (spi_mode & 2) ? SPI_CK_IDLE_EDGE : 0;
+      pin = pin
+#if defined ( SPI_CS0_DIS )
+            | SPI_CS0_DIS
+#endif
+#if defined ( SPI_CS1_DIS )
+            | SPI_CS1_DIS
+#endif
+#if defined ( SPI_CS2_DIS )
+            | SPI_CS2_DIS
+#endif
+#if defined ( SPI_CS3_DIS )
+            | SPI_CS3_DIS
+#endif
+#if defined ( SPI_CS4_DIS )
+            | SPI_CS4_DIS
+#endif
+#if defined ( SPI_CS5_DIS )
+            | SPI_CS5_DIS
+#endif
+      ;
 
       beginTransaction(spi_host);
 
@@ -600,13 +654,7 @@ namespace lgfx
 
     void endTransaction(int spi_host, int spi_cs)
     {
-      if (_spi_dev_handle[spi_host]) {
-#if defined (ARDUINO) // Arduino ESP32
-        spiEndTransaction(_spi_handle[spi_host]);
-#else // ESP-IDF
-        spi_device_release_bus(_spi_dev_handle[spi_host]);
-#endif
-      }
+      endTransaction(spi_host);
       gpio_hi(spi_cs);
     }
 
@@ -647,49 +695,25 @@ namespace lgfx
  #define I2C_ACK_ERR_INT_RAW_M I2C_NACK_INT_RAW_M
 #endif
 
-#if __has_include(<soc/i2c_periph.h>)
     static periph_module_t getPeriphModule(int num)
     {
-      return i2c_periph_signal[num].module;
-    }
+#if SOC_I2C_NUM == 1 || defined CONFIG_IDF_TARGET_ESP32C6
+      return PERIPH_I2C0_MODULE;
 #else
-    static periph_module_t getPeriphModule(int num)
-    {
       return num == 0 ? PERIPH_I2C0_MODULE : PERIPH_I2C1_MODULE;
-    }
 #endif
+    }
 
     static i2c_dev_t* getDev(int num)
     {
-#if defined ( CONFIG_IDF_TARGET_ESP32C3 )
+#if SOC_I2C_NUM == 1 || defined CONFIG_IDF_TARGET_ESP32C6
       return &I2C0;
 #else
       return num == 0 ? &I2C0 : &I2C1;
 #endif
     }
 
-#if defined ( CONFIG_IDF_TARGET_ESP32C3 ) || defined ( CONFIG_IDF_TARGET_ESP32S3 )
-
-    static void updateDev(i2c_dev_t* dev)
-    {
-      dev->ctr.conf_upgate = 1;
-    }
-    static volatile uint32_t* getFifoAddr(int num)
-    {
-#if defined ( CONFIG_IDF_TARGET_ESP32S3 )
-      return &(getDev(num)->data.val);
-#else
-      return &(getDev(num)->fifo_data.val);
-#endif
-    }
-
-    static constexpr int i2c_cmd_start = 6;
-    static constexpr int i2c_cmd_write = 1;
-    static constexpr int i2c_cmd_read  = 3;
-    static constexpr int i2c_cmd_stop  = 2;
-    static constexpr int i2c_cmd_end   = 4;
-
-#else
+#if defined ( CONFIG_IDF_TARGET_ESP32 ) || defined ( CONFIG_IDF_TARGET_ESP32S2 ) || !defined ( CONFIG_IDF_TARGET )
 
     static void updateDev(i2c_dev_t* dev)
     {
@@ -703,6 +727,27 @@ namespace lgfx
     static constexpr int i2c_cmd_write = 1;
     static constexpr int i2c_cmd_read  = 2;
     static constexpr int i2c_cmd_stop  = 3;
+    static constexpr int i2c_cmd_end   = 4;
+
+#else
+
+    static void updateDev(i2c_dev_t* dev)
+    {
+      dev->ctr.conf_upgate = 1;
+    }
+    static volatile uint32_t* getFifoAddr(int num)
+    {
+#if defined ( CONFIG_IDF_TARGET_ESP32S3 ) || defined ( CONFIG_IDF_TARGET_ESP32C6 )
+      return &(getDev(num)->data.val);
+#else
+      return &(getDev(num)->fifo_data.val);
+#endif
+    }
+
+    static constexpr int i2c_cmd_start = 6;
+    static constexpr int i2c_cmd_write = 1;
+    static constexpr int i2c_cmd_read  = 3;
+    static constexpr int i2c_cmd_stop  = 2;
     static constexpr int i2c_cmd_end   = 4;
 
 #endif
@@ -742,7 +787,7 @@ namespace lgfx
       void save_reg(i2c_dev_t* dev)
       {
         auto reg = (volatile uint32_t*)dev;
-#if defined ( CONFIG_IDF_TARGET_ESP32S3 )
+#if defined ( CONFIG_IDF_TARGET_ESP32S3 ) || defined ( CONFIG_IDF_TARGET_ESP32C6 )
         auto fifo_reg = (volatile uint32_t*)(&dev->data);
 #else
         auto fifo_reg = (volatile uint32_t*)(&dev->fifo_data);
@@ -757,7 +802,7 @@ namespace lgfx
       void load_reg(i2c_dev_t* dev)
       {
         auto reg = (volatile uint32_t*)dev;
-#if defined ( CONFIG_IDF_TARGET_ESP32S3 )
+#if defined ( CONFIG_IDF_TARGET_ESP32S3 ) || defined ( CONFIG_IDF_TARGET_ESP32C6 )
         auto fifo_reg = (volatile uint32_t*)(&dev->data);
 #else
         auto fifo_reg = (volatile uint32_t*)(&dev->fifo_data);
@@ -767,6 +812,7 @@ namespace lgfx
           if (fifo_reg == &reg[i]) { continue; }
           reg[i] = _reg_store[i];
         }
+        updateDev(dev);
       }
 
       void setPins(i2c_dev_t* dev, gpio_num_t scl, gpio_num_t sda)
@@ -783,7 +829,13 @@ namespace lgfx
    #endif
   #endif
  #endif
+
+#if SOC_I2C_NUM == 1 || defined CONFIG_IDF_TARGET_ESP32C6
+        auto twowire = &Wire;
+#else
         auto twowire = ((dev == &I2C0) ? &Wire : &Wire1);
+#endif
+
  #if defined ( USE_TWOWIRE_SETPINS )
         twowire->setPins(sda, scl);
  #else
@@ -801,7 +853,7 @@ namespace lgfx
     {
 #if defined ( CONFIG_IDF_TARGET_ESP32C3 )
       return dev->sr.rx_fifo_cnt;
-#elif defined ( CONFIG_IDF_TARGET_ESP32S3 )
+#elif defined ( CONFIG_IDF_TARGET_ESP32S3 ) || defined ( CONFIG_IDF_TARGET_ESP32C6 )
       return dev->sr.rxfifo_cnt;
 #else
       return dev->status_reg.rx_fifo_cnt;
@@ -854,10 +906,6 @@ namespace lgfx
       gpio_set_direction(scl_io, GPIO_MODE_OUTPUT_OD);
       delayMicroseconds(I2C_CLR_BUS_HALF_PERIOD_US);
 
-      auto mod = getPeriphModule(i2c_port);
-      // ESP-IDF環境でperiph_module_disableを使うと、後でenableできなくなる問題が起きたためコメントアウト;
-      //periph_module_disable(mod);
-
       // SDAがHIGHになるまでSTOP送出を繰り返す。;
       int i = 0;
       do
@@ -871,9 +919,10 @@ namespace lgfx
         gpio_set_level(sda_io, 1);
         delayMicroseconds(I2C_CLR_BUS_HALF_PERIOD_US);
       } while (!gpio_get_level(sda_io) && (i++ < I2C_CLR_BUS_SCL_NUM));
-      periph_module_enable(mod);
+
 #if !defined (CONFIG_IDF_TARGET_ESP32C3)
 /// ESP32C3で periph_module_reset を使用すると以後通信不能になる問題が起きたため分岐;
+      auto mod = getPeriphModule(i2c_port);
       periph_module_reset(mod);
 #endif
       i2c_set_pin((i2c_port_t)i2c_port, sda_io, scl_io, gpio_pullup_t::GPIO_PULLUP_ENABLE, gpio_pullup_t::GPIO_PULLUP_ENABLE, I2C_MODE_MASTER);
@@ -894,7 +943,7 @@ namespace lgfx
 
     static cpp::result<void, error_t> i2c_wait(int i2c_port, bool flg_stop = false)
     {
-      if (i2c_context[i2c_port].state.has_error()) { return cpp::fail(i2c_context[i2c_port].state.error()); }
+      if (flg_stop == false && i2c_context[i2c_port].state.has_error()) { return cpp::fail(i2c_context[i2c_port].state.error()); }
       cpp::result<void, error_t> res = {};
       if (i2c_context[i2c_port].state == i2c_context_t::state_disconnect) { return res; }
       auto dev = getDev(i2c_port);
@@ -910,14 +959,13 @@ namespace lgfx
           uint32_t us;
 #if defined ( CONFIG_IDF_TARGET_ESP32C3 )
           uint32_t us_limit = (dev->scl_high_period.period + dev->scl_low_period.period + 16 ) * (1 + dev->sr.tx_fifo_cnt);
-#elif defined ( CONFIG_IDF_TARGET_ESP32S3 )
+#elif defined ( CONFIG_IDF_TARGET_ESP32S3 ) || defined ( CONFIG_IDF_TARGET_ESP32C6 )
           uint32_t us_limit = (dev->scl_high_period.scl_high_period + dev->scl_low_period.scl_low_period + 16 ) * (1 + dev->sr.txfifo_cnt);
 #else
           uint32_t us_limit = (dev->scl_high_period.period + dev->scl_low_period.period + 16 ) * (1 + dev->status_reg.tx_fifo_cnt);
 #endif
-          if (i2c_context[i2c_port].wait_ack_stage == 2) {
-            us_limit += 1024;
-          }
+          us_limit += 512 << i2c_context[i2c_port].wait_ack_stage;
+
           do
           {
             taskYIELD();
@@ -928,7 +976,7 @@ namespace lgfx
         dev->int_clr.val = int_raw.val;
 #if !defined (CONFIG_IDF_TARGET) || defined (CONFIG_IDF_TARGET_ESP32)
         if (!int_raw.end_detect || int_raw.ack_err)
-#elif defined ( CONFIG_IDF_TARGET_ESP32S3 )
+#elif defined ( CONFIG_IDF_TARGET_ESP32S3 ) || defined ( CONFIG_IDF_TARGET_ESP32C6 )
         if (!int_raw.end_detect_int_raw || int_raw.nack_int_raw)
 #else
         if (!int_raw.end_detect || int_raw.nack)
@@ -942,7 +990,7 @@ namespace lgfx
 
       if (flg_stop || res.has_error())
       {
-#if defined ( CONFIG_IDF_TARGET_ESP32S3 )
+#if defined ( CONFIG_IDF_TARGET_ESP32S3 ) || defined ( CONFIG_IDF_TARGET_ESP32C6 )
         if (i2c_context[i2c_port].state == i2c_context_t::state_read || !int_raw.end_detect_int_raw)
 #else
         if (i2c_context[i2c_port].state == i2c_context_t::state_read || !int_raw.end_detect)
@@ -954,14 +1002,16 @@ namespace lgfx
         {
           i2c_set_cmd(dev, 0, i2c_cmd_stop, 0);
           i2c_set_cmd(dev, 1, i2c_cmd_end, 0);
-          dev->ctr.trans_start = 1;
           static constexpr uint32_t intmask_ = I2C_ACK_ERR_INT_RAW_M | I2C_TIME_OUT_INT_RAW_M | I2C_END_DETECT_INT_RAW_M | I2C_ARBITRATION_LOST_INT_RAW_M | I2C_TRANS_COMPLETE_INT_RAW_M;
+          updateDev(dev);
+          dev->int_clr.val = intmask_;
+          dev->ctr.trans_start = 1;
           uint32_t ms = lgfx::millis();
           taskYIELD();
           while (!(dev->int_raw.val & intmask_) && ((millis() - ms) < 14));
 #if !defined (CONFIG_IDF_TARGET) || defined (CONFIG_IDF_TARGET_ESP32)
           if (res.has_value() && dev->int_raw.ack_err)
-#elif defined ( CONFIG_IDF_TARGET_ESP32S3 )
+#elif defined ( CONFIG_IDF_TARGET_ESP32S3 ) || defined ( CONFIG_IDF_TARGET_ESP32C6 )
           if (res.has_value() && dev->int_raw.nack_int_raw)
 #else
           if (res.has_value() && dev->int_raw.nack)
@@ -991,11 +1041,18 @@ namespace lgfx
  #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 0, 0)
   #if defined ARDUINO_ESP32_GIT_VER
     #if ARDUINO_ESP32_GIT_VER != 0x44c11981
-        auto twowire = ((i2c_port == 1) ? &Wire1 : &Wire);
+      #if SOC_I2C_NUM == 1 || defined CONFIG_IDF_TARGET_ESP32C6
+        auto twowire = &Wire;
+      #else
+        auto twowire = ((i2c_port == 0) ? &Wire : &Wire1);
+      #endif
         twowire->end();
     #endif
   #endif
  #endif
+#else
+        auto mod = getPeriphModule(i2c_port);
+        periph_module_disable(mod);
 #endif
         if ((int)i2c_context[i2c_port].pin_scl >= 0)
         {
@@ -1037,11 +1094,26 @@ namespace lgfx
   #endif
  #endif
  #if defined ( USE_TWOWIRE_SETPINS )
-      auto twowire = ((i2c_port == 1) ? &Wire1 : &Wire);
+
+#if SOC_I2C_NUM == 1 || defined CONFIG_IDF_TARGET_ESP32C6
+      auto twowire = &Wire;
+#else
+      auto twowire = ((i2c_port == 0) ? &Wire : &Wire1);
+#endif
       twowire->setPins(pin_sda, pin_scl);
  #endif
 #endif
       return {};
+    }
+
+    cpp::result<int, error_t> getPinSDA(int i2c_port)
+    {
+      return i2c_context[i2c_port].pin_sda;
+    }
+
+    cpp::result<int, error_t> getPinSCL(int i2c_port)
+    {
+      return i2c_context[i2c_port].pin_scl;
     }
 
     cpp::result<void, error_t> init(int i2c_port)
@@ -1059,12 +1131,19 @@ namespace lgfx
       }
 
 #if defined ( ARDUINO ) && __has_include (<Wire.h>)
-      auto twowire = ((i2c_port == 1) ? &Wire1 : &Wire);
+#if SOC_I2C_NUM == 1 || defined CONFIG_IDF_TARGET_ESP32C6
+      auto twowire = &Wire;
+#else
+      auto twowire = ((i2c_port == 0) ? &Wire : &Wire1);
+#endif
  #if defined ( USE_TWOWIRE_SETPINS )
       twowire->begin();
  #else
       twowire->begin((int)i2c_context[i2c_port].pin_sda, (int)i2c_context[i2c_port].pin_scl);
  #endif
+#else
+      auto mod = getPeriphModule(i2c_port);
+      periph_module_enable(mod);
 #endif
 
       i2c_context[i2c_port].initialized = true;
@@ -1124,7 +1203,7 @@ namespace lgfx
       {
         i2c_context[i2c_port].freq = freq;
         static constexpr uint32_t MIN_I2C_CYCLE = 35;
-#if defined (CONFIG_IDF_TARGET_ESP32C3) || defined (CONFIG_IDF_TARGET_ESP32S3)
+#if defined (CONFIG_IDF_TARGET_ESP32C3) || defined (CONFIG_IDF_TARGET_ESP32S3) || defined ( CONFIG_IDF_TARGET_ESP32C6 )
         uint32_t src_clock = 40 * 1000 * 1000; // XTAL clock
 #else
         rtc_cpu_freq_config_t cpu_freq_conf;
@@ -1186,7 +1265,7 @@ namespace lgfx
           cycle = (1<<10)-1;
         }
 
-#if defined (CONFIG_IDF_TARGET_ESP32S3)
+#if defined (CONFIG_IDF_TARGET_ESP32S3) || defined ( CONFIG_IDF_TARGET_ESP32C6 )
         auto wait_high = scl_high_period >> 2;
         dev->scl_high_period.scl_high_period = scl_high_period - wait_high;
         dev->scl_high_period.scl_wait_high_period = wait_high;
@@ -1236,7 +1315,7 @@ namespace lgfx
       auto dev = getDev(i2c_port);
       i2c_context[i2c_port].lock();
 
-#if defined ( CONFIG_IDF_TARGET_ESP32C3 ) ||  defined ( CONFIG_IDF_TARGET_ESP32S3 )
+#if defined ( CONFIG_IDF_TARGET_ESP32C3 ) ||  defined ( CONFIG_IDF_TARGET_ESP32S3 ) || defined ( CONFIG_IDF_TARGET_ESP32C6 )
       if (dev->sr.bus_busy)
 #else
       if (dev->status_reg.bus_busy)
@@ -1248,7 +1327,7 @@ namespace lgfx
         {
           taskYIELD();
         }
-#if defined ( CONFIG_IDF_TARGET_ESP32C3 ) || defined ( CONFIG_IDF_TARGET_ESP32S3 )
+#if defined ( CONFIG_IDF_TARGET_ESP32C3 ) || defined ( CONFIG_IDF_TARGET_ESP32S3 ) || defined ( CONFIG_IDF_TARGET_ESP32C6 )
         while (dev->sr.bus_busy && micros() - ms < 128);
 #else
         while (dev->status_reg.bus_busy && micros() - ms < 128);
@@ -1265,7 +1344,7 @@ namespace lgfx
 #if defined ( CONFIG_IDF_TARGET_ESP32C3 )
       dev->timeout.time_out_value = 31;
       dev->timeout.time_out_en = 1;
-#elif defined ( CONFIG_IDF_TARGET_ESP32S3 )
+#elif defined ( CONFIG_IDF_TARGET_ESP32S3 ) || defined ( CONFIG_IDF_TARGET_ESP32C6 )
       dev->to.time_out_value = 31;
       dev->to.time_out_en = 1;
 #else
@@ -1324,14 +1403,15 @@ namespace lgfx
           ESP_LOGV("LGFX", "i2c write error : ack wait");
           break;
         }
+        i2c_set_cmd(dev, 0, i2c_cmd_write, len);
+        i2c_set_cmd(dev, 1, i2c_cmd_end, 0);
         size_t idx = 0;
         do
         {
           *fifo_addr = data[idx];
         } while (++idx != len);
-        i2c_set_cmd(dev, 0, i2c_cmd_write, len);
-        i2c_set_cmd(dev, 1, i2c_cmd_end, 0);
         updateDev(dev);
+        dev->int_clr.val = 0x1FFFF;
         dev->ctr.trans_start = 1;
         i2c_context[i2c_port].wait_ack_stage = 2;
         data += len;
@@ -1354,7 +1434,7 @@ namespace lgfx
       auto dev = getDev(i2c_port);
 
       size_t len = 0;
-#if defined ( CONFIG_IDF_TARGET_ESP32S3 )
+#if defined ( CONFIG_IDF_TARGET_ESP32S3 ) || defined ( CONFIG_IDF_TARGET_ESP32C6 )
       uint32_t us_limit = ((dev->scl_high_period.scl_high_period + dev->scl_high_period.scl_wait_high_period + dev->scl_low_period.scl_low_period) << 1);
 #elif defined ( CONFIG_IDF_TARGET_ESP32C3 )
       uint32_t us_limit = ((dev->scl_high_period.period + dev->scl_low_period.period) << 1);
@@ -1370,29 +1450,29 @@ namespace lgfx
           break;
         }
 
-        len = length < 33 ? length : 33;
+        len = length < 32 ? length : 32;
         if (length == len && last_nack && len > 1) { --len; }
 
         length -= len;
         i2c_set_cmd(dev, 0, i2c_cmd_read, len, last_nack && length == 0);
         i2c_set_cmd(dev, 1, i2c_cmd_end, 0);
         updateDev(dev);
-        dev->ctr.trans_start = 1;
         dev->int_clr.val = intmask;
+        dev->ctr.trans_start = 1;
 
+        uint32_t us = lgfx::micros();
+        taskYIELD();
+        int delayus = ((us_limit + 2) >> 2) - (lgfx::micros() - us);
+        if (delayus > 0) {
+          delayMicroseconds(delayus);
+        }
         do
         {
-          uint32_t us = lgfx::micros();
-          taskYIELD();
-          us = lgfx::micros() - us;
-          int delayus = ((us_limit + 2) >> 2) - us;
-          if (delayus > 0) {
-            delayMicroseconds(delayus);
-          }
-          while (0 == getRxFifoCount(dev) && !(dev->int_raw.val & intmask) && ((lgfx::micros() - us) <= us_limit + 1024))
+          us = lgfx::micros();
+          do
           {
             taskYIELD();
-          }
+          } while ((len>>1) >= getRxFifoCount(dev) && !(dev->int_raw.val & intmask) && ((lgfx::micros() - us) <= us_limit + 1024));
 
           if (0 == getRxFifoCount(dev))
           {
@@ -1400,9 +1480,10 @@ namespace lgfx
             ESP_LOGW("LGFX", "i2c read error : read timeout");
             res = cpp::fail(error_t::connection_lost);
             i2c_context[i2c_port].state = cpp::fail(error_t::connection_lost);
+            i2c_context[i2c_port].wait_ack_stage = 0;
             return res;
           }
-          *readdata++ = *fifo_addr; //dev->fifo_data.data;
+          *readdata++ = *fifo_addr;
         } while (--len);
       } while (length);
 
@@ -1413,24 +1494,24 @@ namespace lgfx
     {
       cpp::result<void, error_t> res;
       if ((res = beginTransaction(i2c_port, addr, freq, false)).has_value()
-       && (res = writeBytes(i2c_port, writedata, writelen)).has_value()
       )
       {
-        res = endTransaction(i2c_port);
+        res = writeBytes(i2c_port, writedata, writelen);
       }
-      return res;
+      auto last = endTransaction(i2c_port);
+      return res.has_error() ? res : last;
     }
 
     cpp::result<void, error_t> transactionRead(int i2c_port, int addr, uint8_t *readdata, uint8_t readlen, uint32_t freq)
     {
       cpp::result<void, error_t> res;
       if ((res = beginTransaction(i2c_port, addr, freq, true)).has_value()
-       && (res = readBytes(i2c_port, readdata, readlen, true)).has_value()
       )
       {
-        res = endTransaction(i2c_port);
+        res = readBytes(i2c_port, readdata, readlen, true);
       }
-      return res;
+      auto last = endTransaction(i2c_port);
+      return res.has_error() ? res : last;
     }
 
     cpp::result<void, error_t> transactionWriteRead(int i2c_port, int addr, const uint8_t *writedata, uint8_t writelen, uint8_t *readdata, size_t readlen, uint32_t freq)
@@ -1439,12 +1520,12 @@ namespace lgfx
       if ((res = beginTransaction(i2c_port, addr, freq, false)).has_value()
        && (res = writeBytes(i2c_port, writedata, writelen)).has_value()
        && (res = restart(i2c_port, addr, freq, true)).has_value()
-       && (res = readBytes(i2c_port, readdata, readlen, true)).has_value()
       )
       {
-        res = endTransaction(i2c_port);
+        res = readBytes(i2c_port, readdata, readlen, true);
       }
-      return res;
+      auto last = endTransaction(i2c_port);
+      return res.has_error() ? res : last;
     }
 
     cpp::result<uint8_t, error_t> readRegister8(int i2c_port, int addr, uint8_t reg, uint32_t freq)
@@ -1464,6 +1545,88 @@ namespace lgfx
         tmp[1] = (tmp[1] & mask) | data;
       }
       return transactionWrite(i2c_port, addr, tmp, 2, freq);
+    }
+
+
+
+
+    enum pin_index_t {
+      SEARCH_SCL_IDX,
+      SEARCH_SDA_IDX,
+      PIN_SCL_IDX,
+      PIN_SDA_IDX,
+    };
+
+    i2c_temporary_switcher_t::i2c_temporary_switcher_t(int i2c_port, int pin_sda, int pin_scl)
+    : _i2c_port { i2c_port }
+    {
+      int peri_sig_sda = I2CEXT0_SDA_IN_IDX;
+      int peri_sig_scl = I2CEXT0_SCL_IN_IDX;
+#if defined (I2CEXT1_SDA_IN_IDX)
+      if (i2c_port != 0) {
+        peri_sig_sda = I2CEXT1_SDA_IN_IDX;
+        peri_sig_scl = I2CEXT1_SCL_IN_IDX;
+      }
+#endif
+      int search_sda = search_pin_number(peri_sig_sda);
+      int search_scl = search_pin_number(peri_sig_scl);
+
+      if (search_sda != pin_sda || search_scl != pin_scl) {
+        _backuped = true;
+        if (pin_sda >= 0 || pin_scl >= 0) {
+          _pin_backup[PIN_SDA_IDX].setPin(pin_sda);
+          _pin_backup[PIN_SDA_IDX].backup();
+          _pin_backup[PIN_SCL_IDX].setPin(pin_scl);
+          _pin_backup[PIN_SCL_IDX].backup();
+        }
+        if (search_sda >= 0 || search_scl >= 0) {
+#if defined ( ARDUINO ) && __has_include (<Wire.h>)
+          _twowire = nullptr;
+          if (search_sda >=0 && search_scl >= 0) {
+#if defined ( ARDUINO ) && __has_include (<Wire.h>) && defined ( ESP_IDF_VERSION_VAL )
+ #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(4, 0, 0)
+  #if defined ARDUINO_ESP32_GIT_VER
+    #if ARDUINO_ESP32_GIT_VER != 0x44c11981
+            _twowire = &Wire;
+#if defined (I2CEXT1_SDA_IN_IDX)
+            if (i2c_port != 0) { _twowire = &Wire1; }
+#endif
+            _twowire->end();
+    #endif
+  #endif
+ #endif
+#endif
+          }
+#endif
+          i2c::release(_i2c_port);
+          _pin_backup[SEARCH_SDA_IDX].setPin(search_sda);
+          _pin_backup[SEARCH_SCL_IDX].setPin(search_scl);
+          _pin_backup[SEARCH_SDA_IDX].backup();
+          _pin_backup[SEARCH_SCL_IDX].backup();
+          _need_reinit = true;
+        }
+        i2c::init(_i2c_port, pin_sda, pin_scl);
+      }
+    }
+
+    void i2c_temporary_switcher_t::restore(void) {
+      if (_backuped) {
+        i2c::release(_i2c_port);
+        for (auto &b : _pin_backup) {
+          b.restore();
+        }
+        // if (sda >= 0 && scl >= 0) {
+        if (_need_reinit) {
+          int sda = _pin_backup[SEARCH_SDA_IDX].getPin();
+          int scl = _pin_backup[SEARCH_SCL_IDX].getPin();
+#if defined ( ARDUINO ) && __has_include (<Wire.h>)
+          if (_twowire) {
+            _twowire->begin(sda, scl);
+          }
+#endif
+          i2c::init(_i2c_port, sda, scl);
+        }
+      }
     }
 
   }
